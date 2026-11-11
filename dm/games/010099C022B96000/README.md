@@ -84,6 +84,8 @@ General host changes first needed here; each applies to every game:
 
 ## Open
 
+- **Experimental A15/A16 fork work, unvalidated:** [Vulkan capability admission, bounded BC fallback and offline ASTC limits](../../../docs/experimental-a15-a16.md). Galaxy 1 is the first target. This change has no Galaxy A15/A16 gameplay results, format census or memory/performance measurement. The existing native-BC playtests above do not validate the experimental mode. The KTX converter has no verified Hagi archive adapter; runtime textures use the decoder. Compilation, synthetic tests, Mac Metal execution and device gameplay are separate milestones.
+
 - GX points and lines (the geometry shaders) are not done. The player README lists it as a known issue: effects drawn as points or lines come out one pixel wide.
 - The capture timing differs between sources: the game notes say the modules are created in about 15 s on the Mac (the capture "under a minute"); [development.md, The packing script in detail](../../../docs/development.md#the-packing-script-in-detail) says 3,089 keys about 7 s after launch.
 - The `min` / `max` / `clamp` NaN fix (`precise::`, GitHub issue 72) was found on Galaxy 2's GX lighting; its notes have the detail ([0100FD8022DAA000](../0100FD8022DAA000/README.md)). Not stated whether this game showed it.

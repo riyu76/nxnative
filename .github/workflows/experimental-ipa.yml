@@ -1,0 +1,62 @@
+name: Experimental A15-A16 compile fixture
+on:
+  workflow_dispatch:
+  push:
+    branches: [experimental/a15-a16]
+  pull_request:
+    paths:
+      - 'dm/gfx/**'
+      - 'dm/ios/**'
+      - 'scripts/transcode_bc_astc.py'
+      - '.github/workflows/experimental-ipa.yml'
+permissions:
+  contents: read
+concurrency:
+  group: experimental-ipa-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+  GAME: 010099C022B96000 # Galaxy 1 profile constants only; no Nintendo binaries or assets
+  GFXAPI: vulkan
+defaults:
+  run:
+    shell: bash
+jobs:
+  compile-ipa:
+    name: Compile/link only — hardware NOT validated
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          command -v xcodegen || brew install xcodegen
+          command -v astcenc || brew install astcenc
+          xcodebuild -downloadComponent MetalToolchain
+      - name: Portable capability, BC decode and container tests
+        run: python3 -m unittest dm.tools.tests.test_bc_fallback dm.tools.tests.test_bc_astc dm.ios.tests.test_compile_fixture -v
+      - name: Build unsigned IPA with synthetic modules
+        run: |
+          set -o pipefail
+          python3 dm/ios/tools/build_smoke.py --ipa --output "$RUNNER_TEMP/experimental-ipa" 2>&1 | tee "$RUNNER_TEMP/experimental-build.log"
+      - name: Compile forced-path Metal integration test (no GPU execution on CI)
+        run: make -C dm/gfx/tests -j3 t_vk_bc
+      - name: Record validation boundary
+        if: always()
+        run: |
+          echo '### Compilation is separate from device validation' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This job compiles/links and packages an unsigned sideloadable fixture. It contains synthetic zero-filled modules and no copyrighted game data or keys. It cannot run Galaxy. A15/A16 gameplay, memory pressure, rendering and performance remain unvalidated.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: experimental-unsigned-ipa-compile-only
+          path: ${{ runner.temp }}/experimental-ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: experimental-compile-log
+          path: ${{ runner.temp }}/experimental-build.log
+          retention-days: 7

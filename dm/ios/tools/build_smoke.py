@@ -20,9 +20,20 @@ sys.path.insert(0, str(REPO / 'dm/games'))
 import game
 
 
+def package_fixture(app, ipa):
+    info_file = app / 'Info.plist'
+    info = plistlib.loads(info_file.read_bytes())
+    info['DMCiCompileFixture'] = True
+    info_file.write_bytes(plistlib.dumps(info))
+    (app / 'dm').mkdir(exist_ok=True)
+    (app / 'dm' / 'env.txt').write_bytes(b'DM_GPU_COMPAT=1\n')
+    subprocess.run([sys.executable, str(REPO / 'dm/ios/tools/pack_ipa.py'), str(ipa), f'Payload/DmIOS.app={app}'], check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path, help='new scratch directory for inputs and build products')
+    parser.add_argument('--ipa', action='store_true', help='package a sideloadable, unsigned compile fixture; never a playable game')
     args = parser.parse_args()
     profile = game.load(os.environ.get('GAME') or os.environ.get('DM_GAME'))
     root = args.output.resolve()
@@ -55,7 +66,7 @@ def main():
                DM_BUNDLE_ID='org.nxnative.ci', DM_DISPLAY_NAME='CI build fixture',
                DM_APP_VERSION='1.0', DM_APP_CATEGORY=profile.get('app_category'),
                DM_TEAM_ID='', DM_SCHEME_NAME='DmIOS', DM_APPICON='',
-               DM_SHOW_FPS='NO', DM_LANG='en-US')
+               DM_SHOW_FPS='NO', DM_LANG='en-US', GFXAPI=os.environ.get('GFXAPI', 'nvn'))
 
     def run(*command, capture=False):
         return subprocess.run([str(c) for c in command], cwd=project, env=env,
@@ -98,6 +109,11 @@ def main():
             raise RuntimeError(f'Resource staging failed: {packed}')
     if (app / '_CodeSignature').exists() or (app / 'embedded.mobileprovision').exists():
         raise RuntimeError('The smoke-test app must be unsigned')
+    if args.ipa:
+        # Deliberately prevent jumping into the zero-filled synthetic modules after sideloading.
+        ipa = root / 'nxnative-experimental-compile-fixture.ipa'
+        package_fixture(app, ipa)
+        print(f'Unsigned IPA: {ipa}. Compilation/link fixture only; A15/A16 hardware NOT validated.', flush=True)
     print(f'iOS smoke build passed: {executable}', flush=True)
 
 

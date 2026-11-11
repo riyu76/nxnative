@@ -11,6 +11,8 @@ A graphical app that packs games, keeps a library of them or starts them is a pr
 
 ## Building: the NSP script
 
+This fork's [experimental Vulkan compatibility](experimental-a15-a16.md) is opt-in with `DM_GPU_COMPAT=1`. `build_ipa.sh` stamps `DMGraphicsAPI` from `GFXAPI` in the IPA; a non-BC iOS device is admitted only for `vulkan`. Front ends should preserve that stamp and treat compilation, signing/sideloading and hardware gameplay validation as separate results. A15/A16 compatibility is unvalidated.
+
 `scripts/build_ipa_from_nsp.py <NSP folder>` builds one game: an IPA by default, a Mac app with `--platform mac-app`, at the path `-o` names. Its options are in [The packing script in detail](development.md#the-packing-script-in-detail) and `--help`.
 
 With `--progress json` it asks nothing and writes one JSON object per line on stdout. Every object has `ev` (the event) and `t` (Unix time, seconds):

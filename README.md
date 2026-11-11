@@ -36,6 +36,8 @@ Community projects build on nxnative with tools to turn your games into apps for
 
 ## Requirements
 
+This fork also offers an opt-in [experimental A15/A16 Vulkan mode](docs/experimental-a15-a16.md), targeting Galaxy 1 first. Hardware validation is pending; CI compilation does not establish A15 compatibility. The native BC path below remains the default.
+
 - **Mac:** Apple silicon, macOS 26.6 or later. Building games requires Xcode 27.2.
 - **iPhone:** A17 Pro chip or later, with iOS 26 or later.
 - **iPad:** M1 chip or later, with iPadOS 26 or later.

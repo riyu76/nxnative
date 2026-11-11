@@ -21,7 +21,7 @@ The offsets of each level and layer within the storage, and the block height and
 
 ## BC textures
 
-Only GPUs with BC compressed textures are supported (`supportsBCTextureCompression` of `MTLDevice`: Apple silicon Macs and the latest iPhones), so BC textures are created and uploaded as BC; there is no decompression path. A device without them is refused at start ([GPUs without BC textures](../../../docs/reference/rendering.md#gpus-without-bc-textures-are-refused-at-start)). A BC texture is never a render target and its raw blocks are not sampled through an uncompressed view (Metal has no such views; Breath of the Wild encodes one 32×32 BC4 texture on the GPU, GitHub issue #4).
+The default path requires BC-capable GPUs and creates/uploads BC unchanged. This fork has an opt-in [experimental Vulkan decoder](../../../docs/experimental-a15-a16.md), targeting Galaxy 1; A15/A16 hardware validation is pending. `bc_fallback.c` is allocation-free and uses pinned bcdec for BC1–7, including signed BC4/5 and BC6H half floats. NVN still requires native BC: it has GPU-written block aliases this Vulkan experiment does not implement. See [GPUs without BC textures](../../../docs/reference/rendering.md#gpus-without-bc-textures-are-refused-at-start).
 
 ## Tests
 

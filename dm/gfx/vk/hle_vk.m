@@ -26,6 +26,14 @@
 #include <math.h>
 #include <stdatomic.h>
 #include <time.h>
+#include "../tex/bc_fallback.h"
+#include "../tex/gpu_compat.h"
+#include <mach/mach.h>
+#include <TargetConditionals.h>
+#include <objc/runtime.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 
 int mtl_fps_target(void);   // nvn_mtl.m: 60, or 30 when the frame rate is halved
 int mtl_link_active(void); int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // nvn_mtl.m: whether the display link presents, and the wait for its ticks
@@ -122,6 +130,30 @@ static int fmt_has_stencil(const fmt_t *f) { return f && (f->kind == K_STENCIL |
 
 // ---------- Device-wide state ----------
 static id<MTLDevice> g_dev;
+static int g_bc_decode;
+static _Atomic uint64_t g_bc_live, g_bc_peak, g_bc_source, g_bc_uploads, g_bc_ns;
+// Views, descriptors and in-flight commands may outlive VkImage. Charge storage until Metal releases the root texture.
+@interface DmBCStorageCharge : NSObject
+@property uint64_t bytes;
+@end
+@implementation DmBCStorageCharge
+- (void)dealloc { atomic_fetch_sub(&g_bc_live, _bytes); }
+@end
+static char g_bc_charge_key;
+static uint64_t bc_budget(void) { // opt-in budget of expanded texture storage, never the guest heap
+    const char *e = getenv("DM_GPU_COMPAT_MB"); char *end = NULL;
+    unsigned long mb = e ? strtoul(e, &end, 10) : 256;
+    if (e && (!*e || *end || mb < 16 || mb > 2048)) die("DM_GPU_COMPAT_MB must be 16..2048");
+    return (uint64_t)mb << 20;
+}
+static MTLPixelFormat bc_pixel_format(VkFormat f) {
+    switch (dm_bc_format(f)) {
+        case 4: return f == VK_FORMAT_BC4_SNORM_BLOCK ? MTLPixelFormatR8Snorm : MTLPixelFormatR8Unorm;
+        case 5: return f == VK_FORMAT_BC5_SNORM_BLOCK ? MTLPixelFormatRG8Snorm : MTLPixelFormatRG8Unorm;
+        case 6: return MTLPixelFormatRGBA16Float;
+        default: return f == 132 || f == 134 || f == 136 || f == 138 || f == 146 ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
+    }
+}
 static id<MTLCommandQueue> g_q;
 static id<MTLSharedEvent> g_ev;                 // signalled with ++g_ev_val at the end of every submit
 static id<MTLDepthStencilState> g_dss_off;      // pipelines without depth / stencil
@@ -169,7 +201,10 @@ static const shinfo *sh_find(const char *key) { shinfo k; memcpy(k.key, key, 16)
 
 static void dev_init_once(void) {
     @autoreleasepool {
-        g_dev = (__bridge id<MTLDevice>)mtl_device_classic();
+        g_dev = (__bridge id<MTLDevice>)mtl_device_bc_fallback();
+        g_bc_decode = dm_gpu_use_fallback(g_dev);
+        dm_gpu_caps caps = dm_gpu_capabilities(g_dev);
+        VLOG("GPU caps: native_bc=%d astc=%d apple7=%d BC fallback=%d; experimental, device validation pending", caps.bc, caps.astc, caps.apple7, g_bc_decode);
         g_q = [g_dev newCommandQueueWithMaxCommandBufferCount:64]; g_q.label = @"vk";
         g_ev = [g_dev newSharedEvent];
         g_dss_off = [g_dev newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
@@ -194,7 +229,7 @@ struct VkBufferView_T { VkBuffer buf; const fmt_t *f; VkDeviceSize off, range; _
 struct VkImage_T { __strong id<MTLTexture> tex; const fmt_t *f; VkFormat fmt; VkImageType type; uint32_t w, h, d, mips, layers, samples; VkDeviceSize size; uint64_t serial;
                   VkImageUsageFlags usage; uint32_t pitch;   // pitch: row pitch of a linear image (its texture is made over the bound memory), 0 otherwise
                   VkDeviceMemory cmem; VkDeviceSize coff; uint8_t *shadow;   // a linear image of a converted format (fmt_t.conv): its memory, and the texels last unpacked
-                  int swap; };   // one of a swap chain's images: the swap chain owns it
+                  int swap, bc; uint64_t bc_alloc; };   // bc: CPU-decoded storage; size and f still describe the guest's compressed blocks
 struct VkImageView_T { __strong id<MTLTexture> tex; VkImage img; };
 struct VkSampler_T { __strong id<MTLSamplerState> s; };
 struct VkShaderModule_T { const shinfo *si; __strong id<MTLFunction> fn, fn_d; char key[17]; int tried_d; };   // fn_d: the dual-source variant vk_<key>_d, looked up on first use
@@ -321,7 +356,10 @@ static void pdev_feats(VkPhysicalDeviceFeatures *f) {
     memset(f, 0, sizeof *f);
     f->robustBufferAccess = f->fullDrawIndexUint32 = f->imageCubeArray = f->independentBlend = f->sampleRateShading = f->dualSrcBlend = 1;
     f->drawIndirectFirstInstance = f->depthClamp = f->depthBiasClamp = f->fillModeNonSolid = f->largePoints = f->samplerAnisotropy = 1;
-    f->textureCompressionBC = f->textureCompressionASTC_LDR = f->occlusionQueryPrecise = f->fragmentStoresAndAtomics = 1;
+    dev_init();
+    f->textureCompressionBC = !g_bc_decode && g_dev.supportsBCTextureCompression; // the fallback implements a sampled subset, not the entire optional BC feature
+    f->textureCompressionASTC_LDR = dm_gpu_capabilities(g_dev).astc;
+    f->occlusionQueryPrecise = f->fragmentStoresAndAtomics = 1;
     f->shaderImageGatherExtended = f->shaderClipDistance = f->shaderResourceMinLod = 1;
 }
 static void pdev_mem(VkPhysicalDeviceMemoryProperties *m) {
@@ -349,6 +387,11 @@ VK(vkGetPhysicalDeviceQueueFamilyProperties, void, VkPhysicalDevice pd, uint32_t
 VK(vkGetPhysicalDeviceFormatProperties, void, VkPhysicalDevice pd, VkFormat format, VkFormatProperties *p) {
     (void)pd; memset(p, 0, sizeof *p);
     const fmt_t *f = fmt_of(format); if (!f) return;
+    dev_init();
+    if (g_bc_decode && dm_bc_format(format)) {
+        p->optimalTilingFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        return; // no compressed readback, linear aliasing, storage writes or render attachments
+    }
     if (f->vf != MTLVertexFormatInvalid) p->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
     if (f->pf == MTLPixelFormatInvalid) return;
     VkFormatFeatureFlags t = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
@@ -366,6 +409,10 @@ VK(vkGetPhysicalDeviceImageFormatProperties, VkResult, VkPhysicalDevice pd, VkFo
    VkImageCreateFlags flags, VkImageFormatProperties *p) {
     (void)pd; const fmt_t *f = fmt_of(format);
     if (!f || f->pf == MTLPixelFormatInvalid) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    dev_init();
+    if (g_bc_decode && dm_bc_format(format) && (tiling != VK_IMAGE_TILING_OPTIMAL || type != VK_IMAGE_TYPE_2D ||
+        (flags & ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) ||
+        (usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)))) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     memset(p, 0, sizeof *p);
     p->maxExtent = type == VK_IMAGE_TYPE_3D ? (VkExtent3D){2048, 2048, 2048} : (VkExtent3D){16384, type == VK_IMAGE_TYPE_1D ? 1 : 16384, 1};
     p->maxMipLevels = 15; p->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : 2048;
@@ -552,6 +599,16 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
     (void)d; (void)a; dev_init();
     const fmt_t *f = fmt_of(ci->format);
     if (!f || f->pf == MTLPixelFormatInvalid) { LOG("[vk] [RED] image format %d not mapped", ci->format); return VK_ERROR_FORMAT_NOT_SUPPORTED; }
+    int bc = g_bc_decode && dm_bc_format(ci->format);
+    if (bc) {
+        VkImageFormatProperties p;
+        if (h_vkGetPhysicalDeviceImageFormatProperties(NULL, ci->format, ci->imageType, ci->tiling, ci->usage, ci->flags, &p) != VK_SUCCESS || ci->samples != 1)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        uint32_t maxmips = 0; for (uint32_t n = umax(ci->extent.width, ci->extent.height); n; n >>= 1) maxmips++;
+        if (!ci->extent.width || !ci->extent.height || ci->extent.width > 16384 || ci->extent.height > 16384 || ci->extent.depth != 1 ||
+            !ci->arrayLayers || ci->arrayLayers > 2048 || !ci->mipLevels || ci->mipLevels > maxmips) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        if ((ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && (ci->extent.width != ci->extent.height || ci->arrayLayers % 6)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
     // Linear 2D images with one level and layer alias their memory, as on the Switch: the texture is made over the bound buffer at vkBindImageMemory, with rows at
     // Metal's linear-texture alignment (which vkGetImageSubresourceLayout reports). Super Mario Galaxy fills staging images from the CPU this way and samples a 4x4 one
     if (ci->tiling == VK_IMAGE_TILING_LINEAR && ci->imageType == VK_IMAGE_TYPE_2D && ci->mipLevels <= 1 && ci->arrayLayers <= 1 && ci->samples <= 1 && f->kind != K_BLOCK && !fmt_has_depth(f) && !fmt_has_stencil(f)) {
@@ -568,7 +625,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         uint32_t layers = umax(1, ci->arrayLayers), samples = umax(1, ci->samples);
         int cube = (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && layers % 6 == 0;
         MTLTextureDescriptor *td = [MTLTextureDescriptor new];
-        td.pixelFormat = f->pf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
+        td.pixelFormat = bc ? bc_pixel_format(ci->format) : f->pf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
         td.mipmapLevelCount = umax(1, ci->mipLevels); td.sampleCount = samples;
         if (ci->imageType == VK_IMAGE_TYPE_3D) td.textureType = MTLTextureType3D;
         else if (ci->imageType == VK_IMAGE_TYPE_1D) td.textureType = layers > 1 ? MTLTextureType1DArray : MTLTextureType1D;
@@ -582,11 +639,24 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         // A stencil-aspect view of a depth-stencil image is an X32_Stencil8 view, which Metal allows only with the format-view usage (Vulkan needs no mutable-format flag for it;
         // the API validation layer aborts without it). As in the NVN layer, it costs nothing measured on a depth-stencil texture
         if ((ci->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || f->pf == MTLPixelFormatDepth32Float_Stencil8) u |= MTLTextureUsagePixelFormatView;
+        if (bc) u = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
         td.usage = u; td.storageMode = MTLStorageModePrivate;
+        uint64_t reserved = 0;
+        if (bc) {
+            reserved = [g_dev heapTextureSizeAndAlignWithDescriptor:td].size;
+            uint64_t live = atomic_fetch_add(&g_bc_live, reserved) + reserved;
+            if (live > bc_budget()) { atomic_fetch_sub(&g_bc_live, reserved); LOG("[vk] [RED] BC fallback texture budget exceeded: live=%llu requested=%llu budget=%llu", (unsigned long long)(live - reserved), (unsigned long long)reserved, (unsigned long long)bc_budget()); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
+        }
         id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
+        if (!t && reserved) atomic_fetch_sub(&g_bc_live, reserved);
+        if (t && reserved) {
+            DmBCStorageCharge *charge = [DmBCStorageCharge new]; charge.bytes = reserved; objc_setAssociatedObject(t, &g_bc_charge_key, charge, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            uint64_t live = atomic_load(&g_bc_live), peak = atomic_load(&g_bc_peak); while (peak < live && !atomic_compare_exchange_weak(&g_bc_peak, &peak, live)) {}
+        }
         if (!t) { LOG("[vk] [RED] cannot create image %ux%ux%u format %d levels %u layers %u", ci->extent.width, ci->extent.height, ci->extent.depth, ci->format, ci->mipLevels, layers); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
         VkImage im = zalloc(sizeof *im);
         im->tex = t; im->f = f; im->fmt = ci->format; im->type = ci->imageType; im->w = (uint32_t)td.width; im->h = (uint32_t)td.height; im->d = (uint32_t)td.depth;
+        im->bc = bc; im->bc_alloc = reserved;
         im->mips = (uint32_t)td.mipmapLevelCount; im->layers = layers; im->samples = samples; im->size = img_bytes(f, im->w, im->h, im->d, im->mips, layers, samples);
         OLOG("CreateImage %p %ux%ux%u format %d levels %u layers %u usage %#x", (void *)im, im->w, im->h, im->d, ci->format, im->mips, layers, ci->usage);
         *out = im;
@@ -652,10 +722,19 @@ VKB(vkCreateImageView, VkResult, VkDevice d, const VkImageViewCreateInfo *ci, co
     (void)d; (void)a;
     VkImage im = ci->image; const fmt_t *f = fmt_of(ci->format);
     MTLPixelFormat pf = f && f->pf != MTLPixelFormatInvalid ? f->pf : im->f->pf;
+    if (im->bc) {
+        if (!f || !dm_bc_format(ci->format) || dm_bc_format(ci->format) != dm_bc_format(im->fmt)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        int kind = dm_bc_format(im->fmt);
+        if ((kind >= 4 && kind <= 6 && ci->format != im->fmt) || (kind == 1 && (ci->format <= 132) != (im->fmt <= 132)))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED; // decoding cannot preserve a later signed/unsigned or RGB/alpha reinterpretation
+        pf = bc_pixel_format(ci->format);
+    }
     const VkImageSubresourceRange *r = &ci->subresourceRange;
     if (r->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT && pf == MTLPixelFormatDepth32Float_Stencil8) pf = MTLPixelFormatX32_Stencil8;
     uint32_t lv = r->levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r->baseMipLevel : r->levelCount;
     uint32_t ly = r->layerCount == VK_REMAINING_ARRAY_LAYERS ? im->layers - r->baseArrayLayer : r->layerCount;
+    if (im->bc && (r->baseMipLevel >= im->mips || !lv || lv > im->mips - r->baseMipLevel ||
+        r->baseArrayLayer >= im->layers || !ly || ly > im->layers - r->baseArrayLayer)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     MTLTextureType tt;
     switch (ci->viewType) {
         case VK_IMAGE_VIEW_TYPE_1D: tt = MTLTextureType1D; break;
@@ -1232,6 +1311,46 @@ static id<MTLBlitCommandEncoder> blit(rs_t *s, uint32_t op) {
     if (!s->be) s->be = [s->cb blitCommandEncoder];
     return s->be;
 }
+// CPU decode must observe preceding GPU writes, including those in this submission. Commit/wait is deliberately conservative.
+// Only the opt-in path pays for this; never overwrite an upload buffer before Metal has consumed it.
+static void bc_flush(rs_t *s) {
+    if (s->re) { end_rp(s, 0); s->cut = 1; }
+    end_blit(s); [s->cb commit]; [s->cb waitUntilCompleted];
+    if (s->cb.error) die("[vk] BC fallback synchronization failed: %s", s->cb.error.localizedDescription.UTF8String);
+    s->cb = [g_q commandBuffer]; s->applied = NULL;
+}
+static void bc_upload(rs_t *s, VkBuffer src, VkImage im, const VkBufferImageCopy *r) {
+    uint32_t m = r->imageSubresource.mipLevel, layer = r->imageSubresource.baseArrayLayer, nl = r->imageSubresource.layerCount;
+    uint32_t w = r->imageExtent.width, h = r->imageExtent.height;
+    int32_t x = r->imageOffset.x, y = r->imageOffset.y;
+    uint32_t mw = m < im->mips ? umax(1, im->w >> m) : 0, mh = m < im->mips ? umax(1, im->h >> m) : 0;
+    uint32_t rl = r->bufferRowLength ? r->bufferRowLength : w, ih = r->bufferImageHeight ? r->bufferImageHeight : h;
+    if (!w || !h || !nl || x < 0 || y < 0 || (x & 3) || (y & 3) || m >= im->mips || (uint32_t)x > mw || w > mw - x ||
+        (uint32_t)y > mh || h > mh - y || (w % 4 && (uint32_t)x + w != mw) || (h % 4 && (uint32_t)y + h != mh) ||
+        layer >= im->layers || nl > im->layers - layer || r->imageOffset.z || r->imageExtent.depth != 1 || rl < w || ih < h ||
+        (r->bufferRowLength && rl % 4) || (r->bufferImageHeight && ih % 4)) die("[vk] invalid BC fallback upload region");
+    size_t sp, bpi, last;
+    if (!dm_bc_upload_layout(im->fmt, w, h, rl, ih, nl, &sp, &bpi, &last)) die("[vk] BC fallback upload stride overflow");
+    uint64_t off = src->off + r->bufferOffset;
+    if (off < src->off || !src->mem || off > src->mem->size || last > src->mem->size - off || r->bufferOffset > src->size || last > src->size - r->bufferOffset)
+        die("[vk] BC fallback upload exceeds bound memory");
+    bc_flush(s); // after previous GPU writes, before reading the compressed bytes
+    id<MTLBuffer> sb = mem_buf(src->mem); if (!sb) die("[vk] no BC upload buffer");
+    uint64_t start = now_ns(), staged = 0;
+    unsigned pb = dm_bc_pixel_bytes(im->fmt); size_t dp = ((size_t)w * pb + 255) & ~(size_t)255;
+    for (uint32_t l = 0; l < nl; l++) for (uint32_t by = 0; by < h; by += 4) {
+        uint32_t bh = umin(4, h - by); size_t need = dp * bh;
+        id<MTLBuffer> tmp = [g_dev newBufferWithLength:need options:MTLResourceStorageModeShared];
+        if (!tmp) die("[vk] BC fallback staging allocation failed (%zu bytes)", need);
+        const uint8_t *data = (const uint8_t *)sb.contents + off + l * bpi + (by / 4) * sp;
+        if (!dm_bc_decode(im->fmt, w, bh, data, sp, sp, tmp.contents, need, dp)) die("[vk] BC decode bounds failure");
+        [blit(s, C_COPYB2I) copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:dp sourceBytesPerImage:0 sourceSize:MTLSizeMake(w, bh, 1)
+                         toTexture:im->tex destinationSlice:layer + l destinationLevel:m destinationOrigin:MTLOriginMake(x, y + by, 0)];
+        staged += need;
+        if (staged >= (8u << 20)) { bc_flush(s); staged = 0; } // cap in-flight staging at 8 MiB plus one block row
+    }
+    g_bc_uploads++; g_bc_source += last; g_bc_ns += now_ns() - start;
+}
 // The occlusion query running counts the render encoder there is, each from a slot of its own in the submit's visibility buffer. It may have begun outside a render pass (Vulkan lets a query span
 // from before a pass to after it: Super Mario 3D All-Stars' Sunshine, Hagi's GX) and a pass's encoder may be split for a copy: every encoder started while it runs gets a slot
 static void occ_start(rs_t *s) {
@@ -1439,6 +1558,7 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
             case C_COPYB2I: {
                 const c_copyb2i *x = c; VkImage im = x->dst; const fmt_t *f = im->f;
                 if (!x->src->mem || !im->tex) { RED1("the upload buffer has no bound memory or the image was not created"); break; }
+                if (im->bc) { for (uint32_t i = 0; i < x->n; i++) bc_upload(s, x->src, im, &x->r[i]); g_n_copy += x->n; break; }
                 id<MTLBlitCommandEncoder> be = blit(s, h->op); id<MTLBuffer> sb = mem_buf(x->src->mem);
                 for (uint32_t i = 0; i < x->n; i++) {
                     const VkBufferImageCopy *r = &x->r[i];
@@ -1466,6 +1586,7 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
             case C_COPYI: {
                 const c_copyi *x = c; VkImage a = x->src, b = x->dst;
                 if (!a->tex || !b->tex) { RED1("a copied image was not created"); break; }
+                if ((a->bc || b->bc) && (!a->bc || !b->bc || a->fmt != b->fmt)) die("[vk] BC fallback cannot copy between distinct compressed formats");
                 if (a->tex.pixelFormat != b->tex.pixelFormat) { RED1("image copy between different formats (%d → %d) not implemented", a->fmt, b->fmt); break; }
                 id<MTLBlitCommandEncoder> be = blit(s, h->op);
                 for (uint32_t i = 0; i < x->n; i++) {
@@ -1483,6 +1604,7 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
             }
             case C_COPYI2B: {   // read-back into a buffer (shared storage: the CPU sees it once the submit's fence has signalled)
                 const c_copyi2b *x = c; VkImage im = x->src; const fmt_t *f = im->f;
+                if (im->bc) die("[vk] BC fallback compressed readback is unsupported; refusing to write decoded bytes into a BC buffer");
                 if (!x->dst->mem || !im->tex) { RED1("the readback buffer has no bound memory or the image was not created"); break; }
                 id<MTLBlitCommandEncoder> be = blit(s, h->op); id<MTLBuffer> db = mem_buf(x->dst->mem);
                 for (uint32_t i = 0; i < x->n; i++) {
@@ -1518,6 +1640,7 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
                               s->sdyn_set[x->what] = 1; s->s_dirty = 1; break; }
             case C_CLEARI: {   // an image cleared outside a render pass (Super Mario 3D All-Stars' Super Mario 64 clears its depth buffer so): a pass per level and layer that only clears
                 const c_cleari *x = c; VkImage im = x->im;
+                if (im && im->bc) die("[vk] clearing a compressed BC fallback image is unsupported");
                 if (!im || !im->tex) { RED1("a cleared image was not created"); break; }
                 if (s->re) { end_rp(s, 0); s->cut = 1; }
                 end_blit(s);
@@ -1587,7 +1710,7 @@ VKB(vkQueueSubmit, VkResult, VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFe
             sq->occ = zalloc(sq->cap * sizeof *sq->occ);
         }
         for (uint32_t i = 0; i < n; i++)
-            for (uint32_t j = 0; j < si[i].commandBufferCount; j++) { rs_t s = {0}; s.cb = cb; s.sq = sq; replay(&s, si[i].pCommandBuffers[j]); }
+            for (uint32_t j = 0; j < si[i].commandBufferCount; j++) { rs_t s = {0}; s.cb = cb; s.sq = sq; replay(&s, si[i].pCommandBuffers[j]); cb = s.cb; }
         uint64_t v = ++g_ev_val;
         [cb encodeSignalEvent:g_ev value:v];
         if (f) atomic_store(&f->val, v);
@@ -1720,6 +1843,17 @@ VKB(vkAcquireNextImageKHR, VkResult, VkDevice d, VkSwapchainKHR sc, uint64_t tim
     *idx = i; return VK_SUCCESS;
 }
 static uint64_t g_frames;
+static void bc_memory_report(void) {
+    task_vm_info_data_t vm = {0}; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    uint64_t footprint = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS ? vm.phys_footprint : 0;
+    uint64_t available = 0;
+#if TARGET_OS_IPHONE
+    available = os_proc_available_memory();
+#endif
+    VLOG("BC fallback memory: expanded_live=%.1f MiB peak=%.1f MiB budget=%.1f MiB source_uploaded=%.1f MiB uploads=%llu convert_upload_ms=%.1f Metal_allocated=%.1f MiB footprint=%.1f MiB available=%.1f MiB (0=unknown); staging cap 8 MiB plus one block row",
+         g_bc_live / 1048576.0, g_bc_peak / 1048576.0, bc_budget() / 1048576.0, g_bc_source / 1048576.0,
+         (unsigned long long)g_bc_uploads, g_bc_ns / 1000000.0, g_dev.currentAllocatedSize / 1048576.0, footprint / 1048576.0, available / 1048576.0);
+}
 static void frame_end(void) {
     static uint64_t pd, pp, ps, pc;
     uint64_t f = ++g_frames, dr = g_n_draw, pa = g_n_pass, su = g_n_submit, co = g_n_copy;
@@ -1727,6 +1861,7 @@ static void frame_end(void) {
         VLOG("frame %llu: draws %llu, passes %llu, submits %llu, copies %llu (since the last record, %llu frames); pipelines so far %llu, buffer memory %.1f MB", (unsigned long long)f, (unsigned long long)(dr - pd),
              (unsigned long long)(pa - pp), (unsigned long long)(su - ps), (unsigned long long)(co - pc), (unsigned long long)(f <= 3 ? 1 : 300), (unsigned long long)g_n_pso, g_mem_bytes / 1048576.0);
     if (f <= 3 || f % 300 == 0) { pd = dr; pp = pa; ps = su; pc = co; }
+    if (g_bc_decode && (f <= 3 || f % 300 == 0)) bc_memory_report();
     dm_guest_frame_tick();
 }
 VKB(vkQueuePresentKHR, VkResult, VkQueue q, const VkPresentInfoKHR *pi) {

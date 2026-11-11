@@ -13,6 +13,7 @@
 #include "romfs_image.h"
 #include "romfs_identity.h"
 #include "player_env.h"
+#include "../../gfx/tex/gpu_compat.h"
 #ifndef DM_PLAYER_BUILD
 #define DM_PLAYER_BUILD 0
 #endif
@@ -101,15 +102,24 @@ static void aoc_locate(void) {
 // Boot prerequisites (done before UIApplicationMain): directories / environment variables / log -- the host's early load reads these
 // Why a slim build found no usable game files: the verdict on Documents/romfs.img (the first of romfs_document_images), in the log and for the screen (front_ios_boot_message). NULL when the build has no romfs.id
 static char g_boot_message[640];
-const char *front_ios_boot_message(void) { return g_boot_message[0] ? g_boot_message : NULL; }
-// Why this device cannot run the games: its GPU has no BC texture formats, which the games' textures use and the host does not decompress (dm/gfx/tex/README.md; the A16 and older,
-// GitHub issue #704), so the screen says so instead of Metal aborting at the game's first BC texture. NULL on a supported device. Called by startGame (front_ios.m) once the launcher has set
+const char *front_ios_boot_message(void) {
+    if ([[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMCiCompileFixture"] boolValue])
+        return "Compilation/link fixture only. No game code, game data or keys are included. A15/A16 device compatibility has NOT been validated. Build your own Galaxy 1 dump on a Mac for gameplay testing.";
+    return g_boot_message[0] ? g_boot_message : NULL;
+}
+// Why this device cannot run the default path: its GPU has no BC formats (issue #704, A16 and older).
+// The explicit Vulkan-only experiment can admit it; this says nothing about hardware validation.
+// The screen reports rejection before Metal sees a BC texture. Called by startGame (front_ios.m) once the launcher has set
 // its switches: this makes the process's first Metal device, and Metal reads MTL_HUD_ENABLED then; checked at launch, it kept the launcher's Performance HUD off (GitHub issue #840)
 const char *front_ios_device_check(void) {
     static char msg[320]; static int done;
     if (done++) return msg[0] ? msg : NULL;
     id<MTLDevice> gpu = MTLCreateSystemDefaultDevice();   // the system default device, the one the graphics layers take (mtl_init repeats this check for the other routes)
-    if (gpu.supportsBCTextureCompression) return NULL;
+    dm_gpu_caps caps = dm_gpu_capabilities(gpu);
+    fprintf(stderr, "gpu: %s native_bc=%d astc=%d apple7=%d experimental=%d (hardware validation pending)\n",
+            gpu ? gpu.name.UTF8String : "none", caps.bc, caps.astc, caps.apple7, dm_gpu_compat_enabled());
+    if (caps.bc) return NULL;
+    if (gpu && dm_gpu_use_fallback(gpu) && [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMGraphicsAPI"] isEqualToString:@"vulkan"]) return NULL;
     snprintf(msg, sizeof msg, "This device's GPU (%s) cannot read BC-compressed textures, which the games use. It needs an iPhone 15 Pro or newer (A17 Pro chip or later) or an iPad with an M1 chip or later.",
              gpu ? gpu.name.UTF8String : "no Metal device");
     fprintf(stderr, "[RED] boot: %s\n", msg);
@@ -238,7 +248,7 @@ void front_ios_boot(void) {   // Called by front_ios.m once the window and Metal
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);   // the Switch main thread stack is set by npdm; the host gives plenty
     pthread_t t; pthread_create(&t, &a, boot_thread, NULL); pthread_detach(t);
 }
-int front_ios_boot_ok(void) { return g_boot_ok; }
+int front_ios_boot_ok(void) { return g_boot_ok && ![[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMCiCompileFixture"] boolValue]; }
 
 @interface App : UIResponder <UIApplicationDelegate>
 @end
