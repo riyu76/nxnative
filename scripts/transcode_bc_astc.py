@@ -4,7 +4,7 @@
 Writes a new container with ASTC format metadata; never remaps every texture of
 a BC format, modifies the source, or guesses offsets inside unknown archives.
 Galaxy's runtime-generated Wii textures must use the Vulkan runtime fallback.
-Requires a C compiler and Arm's astcenc command-line encoder (e.g. brew install astcenc).
+Requires a C compiler and Arm's official astcenc command-line release on PATH.
 """
 import argparse
 import hashlib

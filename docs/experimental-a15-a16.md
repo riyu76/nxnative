@@ -89,8 +89,11 @@ writes a new file. A game must read the KTX format metadata and support ASTC;
 an engine that hardcodes BC needs its own verified container adapter. There is
 no global BC-to-ASTC runtime format remap and no modification of unknown archives.
 
+Install [Arm's official astcenc release](https://github.com/ARM-software/astc-encoder/releases/tag/5.7.1)
+and put its `bin/astcenc` executable on `PATH`. CI downloads the macOS universal
+5.7.1 archive and checks its published SHA-256 before extraction.
+
 ```sh
-brew install astcenc
 python3 scripts/transcode_bc_astc.py /path/to/source.ktx /path/to/astc-copy.ktx --cache /path/to/private-astc-cache
 ```
 

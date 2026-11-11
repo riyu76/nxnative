@@ -33,7 +33,11 @@ jobs:
       - name: Install build tools
         run: |
           command -v xcodegen || brew install xcodegen
-          command -v astcenc || brew install astcenc
+          curl --fail --location --retry 3 https://github.com/ARM-software/astc-encoder/releases/download/5.7.1/astcenc-5.7.1-macos-universal.zip -o "$RUNNER_TEMP/astcenc.zip"
+          echo 'cb2dd75e33fcc12ebaae9e2230649e30da10c152b029a6d2f3440f6d45ed5c45  '"$RUNNER_TEMP/astcenc.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/astcenc.zip" -d "$RUNNER_TEMP/astcenc"
+          chmod +x "$RUNNER_TEMP/astcenc/bin/astcenc"
+          echo "$RUNNER_TEMP/astcenc/bin" >> "$GITHUB_PATH"
           xcodebuild -downloadComponent MetalToolchain
       - name: Portable capability, BC decode and container tests
         run: python3 -m unittest dm.tools.tests.test_bc_fallback dm.tools.tests.test_bc_astc dm.ios.tests.test_compile_fixture -v
